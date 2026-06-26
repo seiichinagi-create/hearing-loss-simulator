@@ -8,7 +8,7 @@ import librosa
 import threading
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import winsound
+import sounddevice as sd
 import os
 import tempfile
 
@@ -51,11 +51,12 @@ class HearingLossSimulatorApp:
         self.vol_matrices_raw = []   # list[(84, T)] — STFT生データ（変更しない）
         self.is_stereo = False
 
-        self.base_midi = 33
-        self.num_notes = 84
-        self.note_frequencies = 440.0 * (
-            2.0 ** ((np.arange(self.base_midi, self.base_midi + self.num_notes) - 69) / 12.0)
-        )
+        self.base_midi      = 33
+        self.semitone_step  = 0.25                          # 1/4半音刻み
+        self.num_notes      = int(84 / self.semitone_step)  # 336ビン
+        midi_vals = self.base_midi + np.arange(self.num_notes) * self.semitone_step
+        self.note_frequencies = 440.0 * (2.0 ** ((midi_vals - 69) / 12.0))
+        self._smooth_sigma  = 0.0                           # 時間軸平滑化 sigma
 
         self._create_widgets()
 
@@ -179,7 +180,6 @@ class HearingLossSimulatorApp:
 
     def _set_status(self, text):
         self.lbl_status.config(text=text)
-        self.root.update_idletasks()
 
     # ═══════════════════════════════════════════════════ STFT解析 ═══
     def _start_analysis_thread(self):
@@ -205,37 +205,40 @@ class HearingLossSimulatorApp:
         return vm, tf
 
     def _analysis_worker(self):
+        def gui(fn): self.root.after(0, fn)
         try:
-            self.progress["value"] = 5
-            self._set_status("ロード中...")
+            gui(lambda: self.progress.config(value=5))
+            gui(lambda: self._set_status("ロード中..."))
 
             y_raw, sr = librosa.load(self.file_path, sr=None, mono=False)
             self.sr_src = sr
             self.is_stereo = y_raw.ndim == 2
             channels = [y_raw[0], y_raw[1]] if self.is_stereo else [y_raw]
 
-            self._set_status("STFT解析中...")
+            gui(lambda: self._set_status("STFT解析中..."))
             raw_vms, tf = [], None
             for ci, y_ch in enumerate(channels):
                 vm, tf = self._build_volume_matrix(y_ch, sr)
                 raw_vms.append(vm)
-                self.progress["value"] = 10 + 40 * (ci + 1)
+                v = 10 + 40 * (ci + 1)
+                gui(lambda v=v: self.progress.config(value=v))
 
             self.time_frames = tf
             self.vol_matrices_raw = raw_vms
 
-            self._refresh_plot()
-            for btn in (self.btn_play, self.btn_stop, self.btn_save, self.btn_csv):
-                btn.config(state="normal")
-            self.progress["value"] = 100
-            self._set_status("STFT完了 — モードを選んで▶再生")
+            gui(lambda: self._refresh_plot())
+            gui(lambda: [btn.config(state="normal")
+                         for btn in (self.btn_play, self.btn_stop, self.btn_save, self.btn_csv)])
+            gui(lambda: self.progress.config(value=100))
+            gui(lambda: self._set_status("STFT完了 — モードを選んで▶再生"))
 
         except Exception as e:
-            messagebox.showerror("エラー", str(e))
-            self.progress["value"] = 0
-            self._set_status("エラー")
+            err = str(e)
+            gui(lambda: messagebox.showerror("エラー", err))
+            gui(lambda: self.progress.config(value=0))
+            gui(lambda: self._set_status("エラー"))
         finally:
-            self.btn_process.config(state="normal")
+            gui(lambda: self.btn_process.config(state="normal"))
 
     # ═══════════════════════════════════════════════════ 難聴シミュレーション ═══
     def _apply_simulation(self, vol_mat):
@@ -282,7 +285,7 @@ class HearingLossSimulatorApp:
                 t0, t1 = max(0, gc - 1), min(n_frames, gc + 3)
                 result[:, t0:t1] *= 0.07
             # 周波数選択性低下: 隣接ビンへのスメア
-            result = gaussian_filter1d(result, sigma=1.2, axis=0)
+            result = gaussian_filter1d(result, sigma=4.8, axis=0)  # 1/4半音ビン換算
 
         # ── 4. メニエール病 Meniere's ─────────────────────────────
         elif "Meniere" in mode:
@@ -314,7 +317,7 @@ class HearingLossSimulatorApp:
     # ═══════════════════════════════════════════════════ セル消去エフェクト ═══
     def _apply_erase_effect(self, vol_mat):
         n_notes, n_frames = vol_mat.shape
-        bsize    = 10
+        bsize    = 10  # 0.1s @ 10ms hop
         n_tblk   = n_frames // bsize
         threshold = 1.0 - self.sensitivity.get()
         result   = vol_mat.copy()
@@ -349,10 +352,14 @@ class HearingLossSimulatorApp:
         return result
 
     def _get_processed_matrices(self):
-        """raw → simulation → erase(optional) の順に適用"""
+        """raw → simulation → erase(optional) → temporal smoothing の順に適用"""
         mats = [self._apply_simulation(vm) for vm in self.vol_matrices_raw]
         if self.enable_erase.get():
             mats = [self._apply_erase_effect(vm) for vm in mats]
+        # 時間軸平滑化: sigma>0 のときだけ適用（0のとき skip）
+        sigma = self._smooth_sigma
+        if sigma > 0.0:
+            mats = [gaussian_filter1d(m, sigma=sigma, axis=1) for m in mats]
         return mats
 
     # ═══════════════════════════════════════════════════ 合成 ═══
@@ -365,52 +372,80 @@ class HearingLossSimulatorApp:
         return self._synth_cpu(vol_mat, sr)
 
     def _synth_gpu(self, vol_mat, sr):
-        hop = int(sr * 0.01)
-        n_T = vol_mat.shape[1]
+        """チャンク分割GPU合成 — 1344ビン×長尺でもVRAM溢れしない"""
+        hop         = int(sr * 0.01)
+        n_T         = vol_mat.shape[1]
         num_samples = int((self.time_frames[-1] + 0.01) * sr)
+        CHUNK       = int(sr * 6)   # 6秒チャンク（VRAM ~4GB/chunk）
+        wt          = self.wave_type.get()
 
-        t_gpu     = cp.arange(num_samples, dtype=cp.float32) / sr
+        # vol_mat と freqs はチャンク間で共有 → VRAMに常駐
         vm_gpu    = cp.array(vol_mat, dtype=cp.float32)
         freqs_gpu = cp.array(self.note_frequencies, dtype=cp.float32)
+        # 全オシレータにランダム初期位相を付与 → t=0の全波同位相フランジング防止
+        rng_phase = np.random.default_rng()
+        phase_offsets = cp.array(
+            rng_phase.uniform(0.0, 2.0 * np.pi, len(self.note_frequencies)),
+            dtype=cp.float32,
+        )
 
-        t_idx  = t_gpu * (sr / hop)
-        idx_lo = cp.clip(cp.floor(t_idx).astype(cp.int32), 0, n_T - 1)
-        idx_hi = cp.clip(idx_lo + 1, 0, n_T - 1)
-        frac   = (t_idx - idx_lo).astype(cp.float32)
-        amps   = vm_gpu[:, idx_lo] * (1.0 - frac) + vm_gpu[:, idx_hi] * frac  # (84, N)
+        chunks = []
+        for c_start in range(0, num_samples, CHUNK):
+            c_end = min(c_start + CHUNK, num_samples)
 
-        phase = (2.0 * np.pi * freqs_gpu[:, None] * t_gpu[None, :]).astype(cp.float32)
-        wt = self.wave_type.get()
-        if wt == "サイン波":
-            waves = cp.sin(phase)
-        elif wt == "三角波":
-            waves = (2.0 / np.pi) * cp.arcsin(cp.clip(cp.sin(phase), -1.0, 1.0))
-        elif wt == "鋸歯状波":
-            waves = (phase / np.pi) % 2.0 - 1.0
-        else:
-            waves = cp.sign(cp.sin(phase))
+            t_gpu  = cp.arange(c_start, c_end, dtype=cp.float32) / sr
+            t_idx  = t_gpu * (sr / hop)
+            idx_lo = cp.clip(cp.floor(t_idx).astype(cp.int32), 0, n_T - 1)
+            idx_hi = cp.clip(idx_lo + 1, 0, n_T - 1)
+            frac   = (t_idx - idx_lo).astype(cp.float32)
+            amps   = vm_gpu[:, idx_lo] * (1.0 - frac) + vm_gpu[:, idx_hi] * frac
 
-        out  = (waves * amps).sum(axis=0)
-        peak = float(cp.max(cp.abs(out)))
+            phase = (2.0 * np.pi * freqs_gpu[:, None] * t_gpu[None, :]
+                     + phase_offsets[:, None]).astype(cp.float32)
+
+            if wt == "サイン波":
+                waves = cp.sin(phase)
+            elif wt == "三角波":
+                waves = (2.0 / np.pi) * cp.arcsin(cp.clip(cp.sin(phase), -1.0, 1.0))
+            elif wt == "鋸歯状波":
+                waves = (phase / np.pi) % 2.0 - 1.0
+            else:
+                waves = cp.sign(cp.sin(phase))
+
+            chunk_out = (waves * amps).sum(axis=0)
+            chunks.append(cp.asnumpy(chunk_out).astype(np.float32))
+
+            del t_gpu, t_idx, idx_lo, idx_hi, frac, amps, phase, waves, chunk_out
+            cp.get_default_memory_pool().free_all_blocks()
+
+        del vm_gpu, freqs_gpu
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+
+        out  = np.concatenate(chunks)
+        peak = np.max(np.abs(out))
         if peak > 0:
             out /= peak
-        return cp.asnumpy(out).astype(np.float32)
+        return out
 
     def _synth_cpu(self, vol_mat, sr):
         num_samples = int((self.time_frames[-1] + 0.01) * sr)
         t   = np.arange(num_samples, dtype=np.float64) / sr
         out = np.zeros(num_samples)
         wt  = self.wave_type.get()
+        rng_phase = np.random.default_rng()
+        phase_offsets = rng_phase.uniform(0.0, 2.0 * np.pi, len(self.note_frequencies))
         for i, freq in enumerate(self.note_frequencies):
-            amp = np.interp(t, self.time_frames, vol_mat[i])
+            amp   = np.interp(t, self.time_frames, vol_mat[i])
+            theta = 2 * np.pi * freq * t + phase_offsets[i]
             if wt == "サイン波":
-                w = np.sin(2 * np.pi * freq * t)
+                w = np.sin(theta)
             elif wt == "三角波":
-                w = signal.sawtooth(2 * np.pi * freq * t, 0.5)
+                w = signal.sawtooth(theta, 0.5)
             elif wt == "鋸歯状波":
-                w = signal.sawtooth(2 * np.pi * freq * t, 1.0)
+                w = signal.sawtooth(theta, 1.0)
             else:
-                w = signal.square(2 * np.pi * freq * t)
+                w = signal.square(theta)
             out += w * amp
         peak = np.max(np.abs(out))
         if peak > 0:
@@ -418,6 +453,7 @@ class HearingLossSimulatorApp:
         return out.astype(np.float32)
 
     def _build_output(self, vol_matrices):
+        """ステレオ入力→(N,2)、モノ入力→(N,)"""
         sigs = [self._synthesize(vm, self.sr_src) for vm in vol_matrices]
         if len(sigs) == 2:
             n = min(len(s) for s in sigs)
@@ -432,30 +468,33 @@ class HearingLossSimulatorApp:
         threading.Thread(target=self._play_worker, daemon=True).start()
 
     def _play_worker(self):
+        def gui(fn): self.root.after(0, fn)
         try:
             engine = "GPU" if HAS_CUPY else "CPU"
-            self._set_status(f"再合成中({engine})...")
-            self.progress["value"] = 20
+            gui(lambda: self._set_status(f"再合成中({engine})..."))
+            gui(lambda: self.progress.config(value=20))
 
             audio = self._build_output(self._get_processed_matrices())
 
-            self.progress["value"] = 85
-            self._set_status("WAV書き出し中...")
+            gui(lambda: self.progress.config(value=85))
+            gui(lambda: self._set_status("WAV書き出し中..."))
             sf.write(TMPWAV, audio, self.sr_src, subtype="PCM_16")
 
-            self.progress["value"] = 100
             mode_short = self.sim_mode.get().split("  ")[0]
-            self._set_status(f"再生中 [{self.wave_type.get()} / {mode_short}]")
-            winsound.PlaySound(TMPWAV, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            wt = self.wave_type.get()
+            gui(lambda: self.progress.config(value=100))
+            gui(lambda: self._set_status(f"再生中 [{wt} / {mode_short}]"))
+            sd.play(audio, self.sr_src)
 
         except Exception as e:
-            messagebox.showerror("再生エラー", str(e))
-            self._set_status("エラー")
+            err = str(e)
+            gui(lambda: messagebox.showerror("再生エラー", err))
+            gui(lambda: self._set_status("エラー"))
         finally:
-            self.btn_play.config(state="normal")
+            gui(lambda: self.btn_play.config(state="normal"))
 
     def _stop(self):
-        winsound.PlaySound(None, winsound.SND_PURGE)
+        sd.stop()
         self._set_status("停止")
 
     # ═══════════════════════════════════════════════════ 保存 ═══
@@ -471,16 +510,18 @@ class HearingLossSimulatorApp:
         threading.Thread(target=self._save_worker, args=(path,), daemon=True).start()
 
     def _save_worker(self, path):
+        def gui(fn): self.root.after(0, fn)
         try:
-            self._set_status("保存用再合成中...")
+            gui(lambda: self._set_status("保存用再合成中..."))
             audio = self._build_output(self._get_processed_matrices())
             sf.write(path, audio, self.sr_src, subtype="PCM_16")
-            self._set_status("保存完了")
-            messagebox.showinfo("保存完了", path)
+            gui(lambda: self._set_status("保存完了"))
+            gui(lambda: messagebox.showinfo("保存完了", path))
         except Exception as e:
-            messagebox.showerror("保存エラー", str(e))
+            err = str(e)
+            gui(lambda: messagebox.showerror("保存エラー", err))
         finally:
-            self.btn_save.config(state="normal")
+            gui(lambda: self.btn_save.config(state="normal"))
 
     # ═══════════════════════════════════════════════════ CSV ═══
     def _export_csv(self):
@@ -497,7 +538,7 @@ class HearingLossSimulatorApp:
             w = csv.writer(f)
             w.writerow(["MIDI_note"] + [f"{t:.3f}s" for t in self.time_frames])
             for i in range(self.num_notes):
-                w.writerow([self.base_midi + i] + list(vm[i]))
+                w.writerow([self.base_midi + i * self.semitone_step] + list(vm[i]))
         messagebox.showinfo("CSV出力完了", path)
 
     # ═══════════════════════════════════════════════════ プロット ═══
@@ -512,7 +553,7 @@ class HearingLossSimulatorApp:
                   self.base_midi, self.base_midi + self.num_notes]
         self.ax.imshow(data, aspect="auto", origin="lower", extent=extent, cmap="magma")
         self.ax.set_xlabel("Time (s)")
-        self.ax.set_ylabel("MIDI Note (84 keys / 7oct)")
+        self.ax.set_ylabel("MIDI Note (336 bins / 1/4st / 7oct)")
         mode_short = self.sim_mode.get().split("  ")[0]
         title = mode_short
         if self.is_stereo:
