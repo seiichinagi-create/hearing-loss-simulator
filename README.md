@@ -97,6 +97,44 @@ structurally absent.
 
 ---
 
+## Correction Mode & Its Physical Limits (`correction.py`)
+
+If the engine can *simulate* an individual's loss, can it *correct* it — an
+individualized, test-mode-fitted hearing aid? **Partly**, and which dimensions
+can be corrected is set by physics, not engineering. This module makes the
+boundary explicit and **proves it by measurement** (`python correction.py`):
+
+| Dimension | Verdict | Why |
+|-----------|---------|-----|
+| Threshold loss (audiogram) | ◎ correctable | Band gain restores audibility — what every hearing aid does |
+| Loudness recruitment | ◎ correctable | WDRC compression is the *inverse* of the lost cochlear compression |
+| Dead region | △ remap only | No sensors — amplification is useless; frequency-lowering transposes to surviving cochlea (a remap + relearning, not a fix) |
+| Reduced frequency selectivity | ✗ **not correctable** | Broadened filters re-smear any pre-sharpening — a lossy channel; only partial spectral-contrast enhancement |
+| Temporal fine structure loss | ✗ **not correctable** | Envelope-only information cannot be restored |
+
+Closed-loop proof (signal → correction → impaired cochlea → percept):
+
+- **Recruitment (correctable):** audible input dynamic range collapses to
+  27 / 15 / 8 dB at 20 / 40 / 60 dB hearing loss; WDRC restores all to the
+  40 dB normal-hearing value.
+- **Dead region (remap only):** a 5 kHz tone perceived at 565 (normal) drops to
+  0.29 in a 3–8 kHz dead region; +30 dB amplification leaves it at 0.46
+  (still gone); frequency-lowering moves it to a surviving 2–3 kHz band at 126
+  (perception restored).
+- **Selectivity (not correctable):** a two-tone valley of −0.67 dB (normal,
+  tones resolved) fills to +0.32 dB with broadened filters (merged); spectral
+  pre-sharpening leaves it at **+0.32 dB — identical to no correction**. The
+  impaired filter re-smears the sharpened input completely.
+
+**The honest bottom line:** individualized *characterization* (a probe-driven
+test mode) and correction of the invertible dimensions (threshold, recruitment)
+are real and valuable — much of it exists in modern hearing aids as WDRC and
+in-situ audiometry. But selectivity, dead regions, and temporal fine structure
+are lossy at the sensory level: **no pre-processor can restore information the
+cochlea no longer transmits.** Claiming otherwise is where physics gets ignored.
+
+---
+
 ## Keywords
 
 `cochlear implant simulation` · `noise vocoder` · `tone vocoder` · `gammatone filterbank` · `ERB` · `basilar membrane model` · `loudness recruitment` · `sensorineural hearing loss` · `dead regions` · `temporal fine structure` · `hearing loss simulator` · `audiogram simulation` · `presbycusis` · `noise-induced hearing loss` · `NIHL` · `auditory processing disorder` · `APD` · `Meniere's disease` · `cookie-bite audiogram` · `psychoacoustics` · `audiology education` · `hearing rehabilitation`
@@ -140,6 +178,8 @@ pip install cupy-cuda12x
 
 ```bash
 python cochlea_engine.py   # v2 engine self-test (prints verification table)
+python probes.py           # diagnostic probe signals — reveal each pathology
+python correction.py       # correction mode + measured proof of its limits
 python app.py              # v1 GUI application
 ```
 
