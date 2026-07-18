@@ -44,18 +44,19 @@ def erb_space(f_lo, f_hi, n):
 class GammatoneBank:
     """
     4次複素ガンマトーン(1次複素共振器×4段のカスケード)。
-    各チャンネル: y[n] = x[n] + a*y[n-1] を4回。極 a = exp(-2π(β + i·fc)/fs)。
-    β = ERB(fc) * BW_K で帯域幅を ERB に一致させる(BW_K は測定で較正)。
+    各チャンネル: y[n] = x[n] + a*y[n-1] を4回。極 a = exp(-2π(β - i·fc)/fs)。
+    β = ERB(fc) * BW_K * bw_factor で帯域幅を決める。
     """
     ORDER = 4
     BW_K = 1.163  # -3dB帯域幅=ERB に合わせる較正係数(実測: 全帯域で比≈1.0)
-                  # 「周波数選択性低下(SNHL)」病態はこの係数を数倍する
 
-    def __init__(self, fs, cfs):
+    def __init__(self, fs, cfs, bw_factor=1.0):
+        # bw_factor>1 = 聴覚フィルタの広帯域化(周波数選択性低下=SNHL病態)
         self.fs = float(fs)
         self.cfs = np.asarray(cfs, dtype=float)
         self.n_ch = len(self.cfs)
-        beta = erb_hz(self.cfs) * self.BW_K
+        self.bw_factor = float(bw_factor)
+        beta = erb_hz(self.cfs) * self.BW_K * self.bw_factor
         # 複素極 → 共振を +fc(正の解析周波数)に置く
         self.a = np.exp(-2.0 * np.pi * (beta - 1j * self.cfs) / self.fs)
         # 各フィルタを CF で単位利得に正規化(インパルス応答のピーク利得で割る)
@@ -83,33 +84,134 @@ class GammatoneBank:
         return out
 
 
+# ── 聴力図(周波数→損失dB) ───────────────────────────────────────
+def audiogram_gain(cfs, breakpoints_hz, losses_db):
+    """CF ごとの利得(線形)。聴力図を折れ線補間して dB→線形。"""
+    db = np.interp(cfs, breakpoints_hz, losses_db)
+    return db, 10.0 ** (-db / 20.0)
+
+
+# v1 プロファイルを聴力図(=閾値損失曲線)として再利用
+AUDIOGRAMS = {
+    "presbycusis": (  # 加齢性: 高域漸減
+        [125, 250, 500, 1000, 2000, 4000, 8000, 16000],
+        [0, 0, 5, 10, 25, 50, 65, 75]),
+    "nihl": (         # 騒音性: 4kHz ノッチ
+        [125, 500, 1000, 2000, 3000, 4000, 6000, 8000],
+        [0, 5, 10, 15, 35, 55, 40, 30]),
+    "cookie_bite": (  # クッキーバイト: 中域U字
+        [125, 250, 500, 1000, 2000, 4000, 8000],
+        [10, 20, 45, 55, 45, 20, 10]),
+    "flat_severe": (  # 重度平坦
+        [125, 8000], [70, 75]),
+    "normal": ([125, 8000], [0, 0]),
+}
+
+
+# ── 聴覚病態プロファイル ───────────────────────────────────────────
+class HearingProfile:
+    """
+    蝸牛/CI の病態を一括記述。全て土台(フィルタバンク/包絡線)への変換。
+      audiogram      : (breakpoints_hz, losses_db) or None
+      recruitment    : 補充現象(閾値上げ+可聴域圧縮の伸長)を効かせるか
+      bw_factor      : 周波数選択性(1.0=正常, >1=広帯域化)
+      dead_regions   : [(f_lo, f_hi), ...] 無反応帯
+      current_spread_db : CI 電流拡散(dB/チャンネル, 0=なし)
+      n_channels     : 蝸牛符号化のチャンネル数(正常~30, CI=4〜22)
+      carrier        : "tone" / "noise"
+      env_cutoff     : 包絡線LPF[Hz](低い=TFS喪失=CI寄り)
+    """
+    def __init__(self, name="Normal", audiogram=None, recruitment=False,
+                 bw_factor=1.0, dead_regions=None, current_spread_db=0.0,
+                 n_channels=30, carrier="tone", env_cutoff=300.0):
+        self.name = name
+        self.audiogram = audiogram
+        self.recruitment = recruitment
+        self.bw_factor = bw_factor
+        self.dead_regions = dead_regions or []
+        self.current_spread_db = current_spread_db
+        self.n_channels = n_channels
+        self.carrier = carrier
+        self.env_cutoff = env_cutoff
+
+
+def recruitment_gain(env, hl_db, floor_db=-60.0, ceil_db=-6.0):
+    """
+    補充現象: OHC 圧縮の喪失。閾値が hl_db 上がり、可聴域が [Ti, ceil] に狭窄。
+    その狭い入力域を正常のラウドネス幅へ伸長する(=急峻な音量成長)。
+    env(線形) → dB → 区分線形マップ → 線形。閾値下は消音。
+    """
+    hl_db = np.asarray(hl_db, float)[:, None]                 # (n_ch,1)
+    ti = floor_db + hl_db                                     # 上がった閾値
+    ti = np.minimum(ti, ceil_db - 3.0)                        # 重度でも3dB窓は残す
+    ratio = (ceil_db - floor_db) / (ceil_db - ti)             # 伸長比>1
+    L = 20.0 * np.log10(np.maximum(env, 1e-9))
+    O = floor_db + (L - ti) * ratio                           # 伸長後の出力レベル
+    O = np.where(L <= ti, -120.0, O)                          # 閾値下=消音
+    O = np.where(L >= ceil_db, L, O)                          # 大音域=素通し
+    return 10.0 ** (O / 20.0)
+
+
 # ── ボコーダ(分析 → 包絡線 → 病態 → 再合成) ────────────────────
 class CochleaVocoder:
-    def __init__(self, fs, n_channels=30, f_lo=80.0, f_hi=8000.0,
-                 env_cutoff=300.0, carrier="tone", seed=0):
+    def __init__(self, fs, profile=None, f_lo=80.0, f_hi=8000.0, seed=0):
         self.fs = float(fs)
-        self.cfs = erb_space(f_lo, f_hi, n_channels)
-        self.bank = GammatoneBank(fs, self.cfs)
-        self.env_cutoff = env_cutoff        # 包絡線 LPF[Hz](低いほど TFS 喪失=CI 寄り)
-        self.carrier = carrier              # "tone"(正弦) or "noise"(雑音帯域)
+        self.profile = profile or HearingProfile()
+        self.f_lo, self.f_hi = f_lo, f_hi
+        self.cfs = erb_space(f_lo, f_hi, self.profile.n_channels)
+        self.bank = GammatoneBank(fs, self.cfs, bw_factor=self.profile.bw_factor)
         self.rng = np.random.default_rng(seed)
 
     def envelopes(self, x):
         """チャンネル毎包絡線 (n_ch, N)。|解析信号| を LPF。"""
         g = self.bank.analyze(x)
         env = np.abs(g)
-        if self.env_cutoff and self.env_cutoff < self.fs / 2:
-            b, a = butter(2, self.env_cutoff / (self.fs / 2), btype="low")
+        cut = self.profile.env_cutoff
+        if cut and cut < self.fs / 2:
+            b, a = butter(2, cut / (self.fs / 2), btype="low")
             env = lfilter(b, a, env, axis=1)
             env = np.maximum(env, 0.0)
         return env
+
+    def apply_pathology(self, env):
+        """包絡線行列に聴力図→補充現象→デッド領域→CI電流拡散を適用。"""
+        p = self.profile
+        # 1. 聴力図(閾値損失)= チャンネル利得 / 補充現象の閾値
+        hl_db = np.zeros(self.profile.n_channels)
+        if p.audiogram is not None:
+            bp, ls = p.audiogram
+            hl_db, gain = audiogram_gain(self.cfs, bp, ls)
+            if not p.recruitment:
+                env = env * gain[:, None]        # 単純減衰(補充なし)
+        # 2. 補充現象(閾値上げ+可聴域圧縮)
+        if p.recruitment:
+            # 絶対SPL較正が無いので提示レベルを固定: 信号の大音部(99.5%ile)を
+            # ceil 付近(-12dBFS)に置いてから補充現象窓を適用(相対音声の穴を塞ぐ)
+            ref = np.percentile(env, 99.5)
+            if ref > 0:
+                env = env * (10.0 ** (-12.0 / 20.0) / ref)
+            env = recruitment_gain(env, hl_db)
+        # 3. デッド領域(無反応帯 → チャンネルゼロ)
+        for lo, hi in p.dead_regions:
+            env[(self.cfs >= lo) & (self.cfs <= hi)] = 0.0
+        # 4. CI 電流拡散(隣接チャンネルへの指数漏れ)
+        if p.current_spread_db > 0:
+            env = self._current_spread(env, p.current_spread_db)
+        return env
+
+    def _current_spread(self, env, spread_db):
+        n = env.shape[0]
+        idx = np.arange(n)
+        W = 10.0 ** (-np.abs(idx[:, None] - idx[None, :]) * spread_db / 20.0)
+        W /= W.sum(axis=0, keepdims=True)      # 各出力チャンネルで正規化
+        return W @ env
 
     def resynthesize(self, env):
         n_ch, N = env.shape
         t = np.arange(N) / self.fs
         out = np.zeros(N)
         for k in range(n_ch):
-            if self.carrier == "tone":
+            if self.profile.carrier == "tone":
                 phi = self.rng.uniform(0, 2 * np.pi)
                 carrier = np.cos(2 * np.pi * self.cfs[k] * t + phi)
             else:  # noise: チャンネル帯域に絞った白色雑音
@@ -124,7 +226,51 @@ class CochleaVocoder:
         return out.astype(np.float32)
 
     def process(self, x):
-        return self.resynthesize(self.envelopes(x))
+        return self.resynthesize(self.apply_pathology(self.envelopes(x)))
+
+
+# ── プリセット(臨床像 → プロファイル) ───────────────────────────
+def preset(name, fs=None):
+    a = AUDIOGRAMS
+    P = {
+        "健聴 (Normal)":
+            HearingProfile("Normal", n_channels=30, carrier="tone"),
+        "加齢性難聴 (Presbycusis)":
+            HearingProfile("Presbycusis", audiogram=a["presbycusis"],
+                           recruitment=True, bw_factor=1.7),
+        "騒音性難聴 (NIHL 4kHz notch)":
+            HearingProfile("NIHL", audiogram=a["nihl"],
+                           recruitment=True, bw_factor=1.5),
+        "クッキーバイト (Cookie-bite)":
+            HearingProfile("Cookie-bite", audiogram=a["cookie_bite"],
+                           recruitment=True, bw_factor=1.8),
+        "重度感音難聴+デッド領域":
+            HearingProfile("Severe SNHL", audiogram=a["flat_severe"],
+                           recruitment=True, bw_factor=3.0,
+                           dead_regions=[(3000, 8000)]),
+        "人工内耳 16ch":
+            HearingProfile("CI-16", n_channels=16, carrier="noise",
+                           env_cutoff=160.0, current_spread_db=8.0),
+        "人工内耳 8ch":
+            HearingProfile("CI-8", n_channels=8, carrier="noise",
+                           env_cutoff=120.0, current_spread_db=6.0),
+        "人工内耳 4ch (重度)":
+            HearingProfile("CI-4", n_channels=4, carrier="noise",
+                           env_cutoff=50.0, current_spread_db=4.0),
+    }
+    return P[name]
+
+
+PRESET_NAMES = [
+    "健聴 (Normal)",
+    "加齢性難聴 (Presbycusis)",
+    "騒音性難聴 (NIHL 4kHz notch)",
+    "クッキーバイト (Cookie-bite)",
+    "重度感音難聴+デッド領域",
+    "人工内耳 16ch",
+    "人工内耳 8ch",
+    "人工内耳 4ch (重度)",
+]
 
 
 # ══════════════════════════════════════════════ 自己検証(記憶でなく測定) ══
@@ -194,22 +340,51 @@ def _self_test():
         tt = np.arange(int(fs * 1.0)) / fs
         x = sum(np.sin(2 * np.pi * f0 * tt) for f0 in (220, 440, 880, 1760)) / 4
         src = "合成4トーン(wav無し)"
-    print(f"\n[4] 実音再合成 ({src}, sr={sr})")
-    cen0 = _centroid(x, sr)
-    print(f"    {'条件':<22}{'RMS dB':>8}{'ピーク':>7}{'重心Hz':>8}{'NaN':>5}")
-    print(f"    {'原音':<22}{20*np.log10(_rms(x)+1e-12):8.1f}{np.abs(x).max():7.2f}{cen0:8.0f}{'-':>5}")
-    for n_ch, carrier, cut, label in [
-        (30, "tone",  300, "健聴30ch/tone"),
-        (30, "noise", 300, "健聴30ch/noise"),
-        (8,  "noise", 160, "CI 8ch/noise"),
-        (4,  "noise", 50,  "CI 4ch/noise(重度)"),
-    ]:
-        voc = CochleaVocoder(sr, n_channels=n_ch, carrier=carrier, env_cutoff=cut)
+    print(f"\n[4] 全プリセット再合成 ({src}, sr={sr})")
+    print(f"    {'プリセット':<26}{'RMS dB':>8}{'重心Hz':>8}{'NaN':>5}")
+    print(f"    {'原音':<26}{20*np.log10(_rms(x)+1e-12):8.1f}{_centroid(x,sr):8.0f}{'-':>5}")
+    for name in PRESET_NAMES:
+        voc = CochleaVocoder(sr, profile=preset(name))
         y = voc.process(x)
         nan = np.isnan(y).any() or np.isinf(y).any()
-        print(f"    {label:<22}{20*np.log10(_rms(y)+1e-12):8.1f}"
-              f"{np.abs(y).max():7.2f}{_centroid(y,sr):8.0f}{str(nan):>5}")
-    print("\n    期待: chを減らすと重心・微細構造が崩れる=CI符号化の劣化(=正しい挙動)")
+        print(f"    {name:<26}{20*np.log10(_rms(y)+1e-12):8.1f}"
+              f"{_centroid(y,sr):8.0f}{str(nan):>5}")
+
+    # 5) 補充現象: 可聴入力ダイナミックレンジが HL ぶん狭窄するか
+    print(f"\n[5] 補充現象の検証 (入力 -80→0dB スイープ, ceil=-6/floor=-60)")
+    sweep = 10.0 ** (np.linspace(-80, 0, 400) / 20.0)[None, :]   # (1,400) 線形
+    print(f"    {'HL dB':>6}{'可聴入力域dB':>12}{'理論(=54-HL)':>14}")
+    for hl in [0, 20, 40, 60]:
+        out = recruitment_gain(sweep, np.array([hl]))
+        audible = out[0] > 10 ** (-40 / 20.0)   # -40dB以上出る入力を可聴とみなす
+        Lin = 20 * np.log10(sweep[0])
+        rng = (Lin[audible].max() - Lin[audible].min()) if audible.any() else 0.0
+        print(f"    {hl:6d}{rng:12.1f}{max(54-hl,0):14d}")
+    print("    → HLが増えるほど可聴入力域が狭まる=感音難聴の狭ダイナミックレンジ")
+
+    # 6) 周波数選択性低下: bw_factor で実測帯域幅が広がるか
+    print(f"\n[6] 周波数選択性低下 (2140Hz チャンネルの実測BW)")
+    for bwf in [1.0, 2.0, 4.0]:
+        b2 = GammatoneBank(fs, cfs, bw_factor=bwf)
+        _, bwm = _measure_filter(b2, 18, fs)
+        print(f"    bw_factor={bwf:.1f}: 実測BW={bwm:6.1f}Hz (ERB={erb_hz(cfs[18]):.0f}Hz, 比{bwm/erb_hz(cfs[18]):.2f})")
+    print("    → 係数どおり広帯域化=聴覚フィルタの鈍化(スメアリング)")
+
+    # 7) デッド領域: 指定帯のチャンネルがゼロか
+    print(f"\n[7] デッド領域 (3000-8000Hz を無反応化)")
+    voc = CochleaVocoder(sr, profile=preset("重度感音難聴+デッド領域"))
+    env = voc.apply_pathology(voc.envelopes(x))
+    dead = (voc.cfs >= 3000) & (voc.cfs <= 8000)
+    print(f"    デッド帯チャンネルの最大包絡線: {env[dead].max():.2e} (=0 が期待)")
+    print(f"    生存帯チャンネルの最大包絡線: {env[~dead].max():.2e} (>0)")
+
+    # 8) CI電流拡散: 単一チャンネル励起が隣へ漏れるか
+    print(f"\n[8] CI電流拡散 (8ch, spread=6dB/ch, ch3のみ励起)")
+    voc = CochleaVocoder(sr, profile=preset("人工内耳 8ch"))
+    e = np.zeros((8, 1)); e[3, 0] = 1.0
+    spread = voc._current_spread(e, 6.0)[:, 0]
+    print(f"    出力: {np.round(spread, 3)}")
+    print(f"    → ch3ピーク+隣接へ指数減衰の漏れ=電極間干渉(空間スメアリング)")
     print("=" * 62)
 
 
