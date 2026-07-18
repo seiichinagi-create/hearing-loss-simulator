@@ -177,11 +177,19 @@ pip install cupy-cuda12x
 ## Usage
 
 ```bash
+python app_cochlea.py      # v2 GUI — cochlear/CI simulator (presets, A/B, probes)
 python cochlea_engine.py   # v2 engine self-test (prints verification table)
 python probes.py           # diagnostic probe signals — reveal each pathology
 python correction.py       # correction mode + measured proof of its limits
-python app.py              # v1 GUI application
+python app.py              # v1 GUI application (STFT — kept for reference)
 ```
+
+The **v2 GUI** (`app_cochlea.py`) loads an audio file or a diagnostic probe,
+resynthesizes it through a chosen pathology preset (normal / presbycusis / NIHL /
+cookie-bite / severe SNHL / cochlear implant 4–16 ch), lets you A/B the original
+against the simulated percept, and displays the correctability registry on screen
+so the limits stay explicit. Processing runs on a worker thread. `app.py` (v1
+STFT) is left untouched for reference.
 
 ---
 
