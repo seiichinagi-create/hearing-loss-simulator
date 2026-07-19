@@ -24,6 +24,10 @@ import numpy as np
 import soundfile as sf
 import sounddevice as sd
 import librosa
+import matplotlib
+# matplotlib既定フォントは日本語グリフ非対応(グラフ内が豆腐化)→ Windows標準の和文フォントへ
+matplotlib.rcParams["font.family"] = ["Yu Gothic", "Meiryo", "MS Gothic", "DejaVu Sans"]
+matplotlib.rcParams["axes.unicode_minus"] = False
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
