@@ -188,8 +188,21 @@ The **v2 GUI** (`app_cochlea.py`) loads an audio file or a diagnostic probe,
 resynthesizes it through a chosen pathology preset (normal / presbycusis / NIHL /
 cookie-bite / severe SNHL / cochlear implant 4–16 ch), lets you A/B the original
 against the simulated percept, and displays the correctability registry on screen
-so the limits stay explicit. Processing runs on a worker thread. `app.py` (v1
-STFT) is left untouched for reference.
+so the limits stay explicit. The interface is **bilingual (English / Japanese,
+default English)**; switching language preserves loaded audio and settings.
+Processing runs on a worker thread. `app.py` (v1 STFT) is left untouched for
+reference.
+
+### Side effect: it is also a sound-design vocoder
+
+Because the v2 engine *is* a gammatone-analysis channel vocoder — the same class
+of tool used in music production — it doubles as a creative sound-design
+processor. Feeding an instrument or voice through the CI presets (few channels,
+noise carrier) gives the classic vocoded / robotized texture; the ERB filterbank
+and per-channel envelopes are a general spectral-modulation substrate. This was
+not the goal — it fell out of building the hearing simulation correctly — but the
+resynthesis quality turned out to be musically usable, so it is noted here as a
+genuine dual use rather than a designed feature.
 
 ---
 
